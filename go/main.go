@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -21,6 +22,7 @@ import (
 	goji "goji.io"
 	"goji.io/pat"
 	"golang.org/x/crypto/bcrypt"
+	_ "net/http/pprof"
 )
 
 const (
@@ -276,9 +278,16 @@ func init() {
 	templates = template.Must(template.ParseFiles(
 		"../public/index.html",
 	))
+
+	one1 = new(sync.Once)
+	categories = make([]Category, 70)
 }
 
 func main() {
+	go func() {
+		http.ListenAndServe(":6060", nil)
+	}()
+
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
 		host = "127.0.0.1"
@@ -356,6 +365,9 @@ func main() {
 	mux.HandleFunc(pat.Get("/users/setting"), getIndex)
 	// Assets
 	mux.Handle(pat.Get("/*"), http.FileServer(http.Dir("../public")))
+
+	getCategoryByID(dbx, 0)
+
 	log.Fatal(http.ListenAndServe(":8000", mux))
 }
 
@@ -407,16 +419,22 @@ func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err
 	return userSimple, err
 }
 
-func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err error) {
-	err = sqlx.Get(q, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
-	if category.ParentID != 0 {
-		parentCategory, err := getCategoryByID(q, category.ParentID)
-		if err != nil {
-			return category, err
+var one1 *sync.Once
+var categories []Category
+
+func getCategoryByID(q sqlx.Queryer, categoryID int) (Category, error) {
+	one1.Do(func() {
+		for i := 0; i < 70; i++ {
+			err := sqlx.Get(q, &categories[i], "SELECT * FROM `categories` WHERE `id` = ?", i)
+			if err != nil {
+				continue
+			}
+			if categories[i].ParentID != 0 {
+				categories[i].ParentCategoryName = categories[categories[i].ParentID].CategoryName
+			}
 		}
-		category.ParentCategoryName = parentCategory.CategoryName
-	}
-	return category, err
+	})
+	return categories[categoryID], nil
 }
 
 func getConfigByName(name string) (string, error) {
