@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="initial3">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/ruby/public/initial.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
