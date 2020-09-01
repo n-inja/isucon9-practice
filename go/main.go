@@ -407,9 +407,9 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	return user, http.StatusOK, ""
 }
 
-func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err error) {
+func getUserSimpleByID(_ sqlx.Queryer, userID int64) (userSimple UserSimple, err error) {
 	user := User{}
-	err = sqlx.Get(q, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+	err = sqlx.Get(dbx, &user, "SELECT id, account_name, num_sell_items FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return userSimple, err
 	}
@@ -659,80 +659,83 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var inQuery string
-	var inArgs []interface{}
-	if itemID > 0 && createdAt > 0 {
-		// paging
-		inQuery, inArgs, err = sqlx.In(
-			"SELECT * FROM `items` WHERE `status` IN (?,?) AND category_id IN (?) AND (`created_at` < ?  OR (`created_at` <= ? AND `id` < ?)) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
-			ItemStatusOnSale,
-			ItemStatusSoldOut,
-			categoryIDs,
-			time.Unix(createdAt, 0),
-			time.Unix(createdAt, 0),
-			itemID,
-			ItemsPerPage+1,
-		)
+	itemSimples := make([]ItemSimple, ItemsPerPage+1)
+	itemsCount := 0
+	{
+		var rows *sqlx.Rows
+		var sqlStr string
+		var params []interface{}
+		if itemID > 0 && createdAt > 0 {
+			// paging
+			sqlStr, params, err = sqlx.In(
+				"SELECT i.id, i.seller_id, i.status, i.name, i.price, i.image_name, i.category_id, i.created_at, u.account_name, u.num_sell_items FROM `items` i JOIN `users` u ON i.seller_id = u.id WHERE i.`status` IN (?,?) AND i.category_id IN (?) AND (i.`created_at` < ?  OR (i.`created_at` <= ? AND i.`id` < ?)) ORDER BY i.`created_at` DESC, i.`id` DESC LIMIT ?",
+				ItemStatusOnSale,
+				ItemStatusSoldOut,
+				categoryIDs,
+				time.Unix(createdAt, 0),
+				time.Unix(createdAt, 0),
+				itemID,
+				ItemsPerPage+1,
+			)
+		} else {
+			// 1st page
+			sqlStr, params, err = sqlx.In(
+				"SELECT i.id, i.seller_id, i.status, i.name, i.price, i.image_name, i.category_id, i.created_at, u.account_name, u.num_sell_items FROM `items` i JOIN `users` u ON i.seller_id = u.id WHERE i.`status` IN (?,?) AND i.category_id IN (?) ORDER BY i.created_at DESC, i.id DESC LIMIT ?",
+				ItemStatusOnSale,
+				ItemStatusSoldOut,
+				categoryIDs,
+				ItemsPerPage+1)
+		}
 		if err != nil {
 			log.Print(err)
 			outputErrorMsg(w, http.StatusInternalServerError, "db error")
 			return
 		}
-	} else {
-		// 1st page
-		inQuery, inArgs, err = sqlx.In(
-			"SELECT * FROM `items` WHERE `status` IN (?,?) AND category_id IN (?) ORDER BY created_at DESC, id DESC LIMIT ?",
-			ItemStatusOnSale,
-			ItemStatusSoldOut,
-			categoryIDs,
-			ItemsPerPage+1,
-		)
+
+		rows, err = dbx.Queryx(sqlStr, params...)
+
 		if err != nil {
 			log.Print(err)
 			outputErrorMsg(w, http.StatusInternalServerError, "db error")
 			return
 		}
-	}
+		defer rows.Close()
 
-	items := []Item{}
-	err = dbx.Select(&items, inQuery, inArgs...)
-
-	if err != nil {
-		log.Print(err)
-		outputErrorMsg(w, http.StatusInternalServerError, "db error")
-		return
-	}
-
-	itemSimples := []ItemSimple{}
-	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
-		if err != nil {
-			outputErrorMsg(w, http.StatusNotFound, "seller not found")
-			return
+		var t time.Time
+		var imageName string
+		for rows.Next() {
+			// i.id, i.seller_id, i.status, i.name, i.price, i.image_name, i.category_id, i.created_at, u.account_name, u.num_sell_items
+			itemSimples[itemsCount].Seller = &UserSimple{}
+			err = rows.Scan(
+				&itemSimples[itemsCount].ID,
+				&itemSimples[itemsCount].SellerID,
+				&itemSimples[itemsCount].Status,
+				&itemSimples[itemsCount].Name,
+				&itemSimples[itemsCount].Price,
+				&imageName,
+				&itemSimples[itemsCount].CategoryID,
+				&t,
+				&itemSimples[itemsCount].Seller.AccountName,
+				&itemSimples[itemsCount].Seller.NumSellItems)
+			itemSimples[itemsCount].CreatedAt = t.Unix()
+			itemSimples[itemsCount].ImageURL = getImageURL(imageName)
+			category, err := getCategoryByID(dbx, itemSimples[itemsCount].CategoryID)
+			itemSimples[itemsCount].Category = &category
+			itemSimples[itemsCount].Seller.ID = itemSimples[itemsCount].SellerID
+			if err != nil {
+				outputErrorMsg(w, http.StatusNotFound, "seller not found")
+				return
+			}
+			itemsCount = itemsCount + 1
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
-		if err != nil {
-			outputErrorMsg(w, http.StatusNotFound, "category not found")
-			return
-		}
-		itemSimples = append(itemSimples, ItemSimple{
-			ID:         item.ID,
-			SellerID:   item.SellerID,
-			Seller:     &seller,
-			Status:     item.Status,
-			Name:       item.Name,
-			Price:      item.Price,
-			ImageURL:   getImageURL(item.ImageName),
-			CategoryID: item.CategoryID,
-			Category:   &category,
-			CreatedAt:  item.CreatedAt.Unix(),
-		})
 	}
 
 	hasNext := false
-	if len(itemSimples) > ItemsPerPage {
+	if itemsCount > ItemsPerPage {
 		hasNext = true
 		itemSimples = itemSimples[0:ItemsPerPage]
+	} else {
+		itemSimples = itemSimples[0:itemsCount]
 	}
 
 	rni := resNewItems{
