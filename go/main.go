@@ -555,68 +555,81 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	items := []Item{}
-	if itemID > 0 && createdAt > 0 {
-		// paging
-		err := dbx.Select(&items,
-			"SELECT * FROM `items` WHERE `status` IN (?,?) AND (`created_at` < ?  OR (`created_at` <= ? AND `id` < ?)) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
-			ItemStatusOnSale,
-			ItemStatusSoldOut,
-			time.Unix(createdAt, 0),
-			time.Unix(createdAt, 0),
-			itemID,
-			ItemsPerPage+1,
-		)
+	itemSimples := make([]ItemSimple, ItemsPerPage+1)
+	itemsCount := 0
+	{
+		var rows *sqlx.Rows
+		var sqlStr string
+		var params []interface{}
+		if itemID > 0 && createdAt > 0 {
+			// paging
+			sqlStr, params, err = sqlx.In(
+				"SELECT i.id, i.seller_id, i.status, i.name, i.price, i.image_name, i.category_id, i.created_at, u.account_name, u.num_sell_items FROM `items` i JOIN `users` u ON i.seller_id = u.id WHERE i.`status` IN (?,?) AND (i.`created_at` < ?  OR (i.`created_at` <= ? AND i.`id` < ?)) ORDER BY i.`created_at` DESC, i.`id` DESC LIMIT ?",
+				ItemStatusOnSale,
+				ItemStatusSoldOut,
+				time.Unix(createdAt, 0),
+				time.Unix(createdAt, 0),
+				itemID,
+				ItemsPerPage+1,
+			)
+		} else {
+			// 1st page
+			sqlStr, params, err = sqlx.In(
+				"SELECT i.id, i.seller_id, i.status, i.name, i.price, i.image_name, i.category_id, i.created_at, u.account_name, u.num_sell_items FROM `items` i JOIN `users` u ON i.seller_id = u.id WHERE i.`status` IN (?,?) ORDER BY i.created_at DESC, i.id DESC LIMIT ?",
+				ItemStatusOnSale,
+				ItemStatusSoldOut,
+				ItemsPerPage+1)
+		}
 		if err != nil {
 			log.Print(err)
 			outputErrorMsg(w, http.StatusInternalServerError, "db error")
 			return
 		}
-	} else {
-		// 1st page
-		err := dbx.Select(&items,
-			"SELECT * FROM `items` WHERE `status` IN (?,?) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
-			ItemStatusOnSale,
-			ItemStatusSoldOut,
-			ItemsPerPage+1,
-		)
-		if err != nil {
-			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
-			return
-		}
-	}
 
-	itemSimples := []ItemSimple{}
-	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
+		rows, err = dbx.Queryx(sqlStr, params...)
+
 		if err != nil {
-			outputErrorMsg(w, http.StatusNotFound, "seller not found")
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
-		if err != nil {
-			outputErrorMsg(w, http.StatusNotFound, "category not found")
-			return
+		defer rows.Close()
+
+		var t time.Time
+		var imageName string
+		for rows.Next() {
+			// i.id, i.seller_id, i.status, i.name, i.price, i.image_name, i.category_id, i.created_at, u.account_name, u.num_sell_items
+			itemSimples[itemsCount].Seller = &UserSimple{}
+			err = rows.Scan(
+				&itemSimples[itemsCount].ID,
+				&itemSimples[itemsCount].SellerID,
+				&itemSimples[itemsCount].Status,
+				&itemSimples[itemsCount].Name,
+				&itemSimples[itemsCount].Price,
+				&imageName,
+				&itemSimples[itemsCount].CategoryID,
+				&t,
+				&itemSimples[itemsCount].Seller.AccountName,
+				&itemSimples[itemsCount].Seller.NumSellItems)
+			itemSimples[itemsCount].CreatedAt = t.Unix()
+			itemSimples[itemsCount].ImageURL = getImageURL(imageName)
+			category, err := getCategoryByID(dbx, itemSimples[itemsCount].CategoryID)
+			itemSimples[itemsCount].Category = &category
+			itemSimples[itemsCount].Seller.ID = itemSimples[itemsCount].SellerID
+			if err != nil {
+				outputErrorMsg(w, http.StatusNotFound, "seller not found")
+				return
+			}
+			itemsCount = itemsCount + 1
 		}
-		itemSimples = append(itemSimples, ItemSimple{
-			ID:         item.ID,
-			SellerID:   item.SellerID,
-			Seller:     &seller,
-			Status:     item.Status,
-			Name:       item.Name,
-			Price:      item.Price,
-			ImageURL:   getImageURL(item.ImageName),
-			CategoryID: item.CategoryID,
-			Category:   &category,
-			CreatedAt:  item.CreatedAt.Unix(),
-		})
 	}
 
 	hasNext := false
-	if len(itemSimples) > ItemsPerPage {
+	if itemsCount > ItemsPerPage {
 		hasNext = true
 		itemSimples = itemSimples[0:ItemsPerPage]
+	} else {
+		itemSimples = itemSimples[0:itemsCount]
 	}
 
 	rni := resNewItems{
@@ -905,7 +918,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	if itemID > 0 && createdAt > 0 {
 		// paging
 		rows, err = dbx.Queryx(
-			"SELECT i.id, i.seller_id, i.buyer_id, i.status, i.name, i.price, i.description, i.image_name, i.category_id, i.created_at, s.account_name, s.num_sell_items, b.account_name, b.num_sell_items, t.id, t.status, sh.reserve_id FROM `items` i JOIN `users` s ON i.seller_id = s.id LEFT JOIN `users` b ON i.buyer_id = b.id LEFT JOIN `transaction_evidences` t ON i.id = t.item_id LEFT JOIN `shippings` sh ON t.id = sh.transaction_evidence_id WHERE (i.`seller_id` = ? OR i.`buyer_id` = ?) AND i.`status` IN (?,?,?,?,?) AND (i.`created_at` < ?  OR (i.`created_at` <= ? AND i.`id` < ?)) ORDER BY i.`created_at` DESC, i.`id` DESC LIMIT ?",
+			"SELECT i.id, i.seller_id, i.buyer_id, i.status, i.name, i.price, i.description, i.image_name, i.category_id, i.created_at, s.account_name, s.num_sell_items, b.account_name, b.num_sell_items, t.id, t.status, sh.status FROM `items` i JOIN `users` s ON i.seller_id = s.id LEFT JOIN `users` b ON i.buyer_id = b.id LEFT JOIN `transaction_evidences` t ON i.id = t.item_id LEFT JOIN `shippings` sh ON t.id = sh.transaction_evidence_id WHERE (i.`seller_id` = ? OR i.`buyer_id` = ?) AND i.`status` IN (?,?,?,?,?) AND (i.`created_at` < ?  OR (i.`created_at` <= ? AND i.`id` < ?)) ORDER BY i.`created_at` DESC, i.`id` DESC LIMIT ?",
 			userID,
 			userID,
 			ItemStatusOnSale,
@@ -926,7 +939,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// 1st page
 		rows, err = dbx.Queryx(
-			"SELECT i.id, i.seller_id, i.buyer_id, i.status, i.name, i.price, i.description, i.image_name, i.category_id, i.created_at, s.account_name, s.num_sell_items, b.account_name, b.num_sell_items, t.id, t.status, sh.reserve_id FROM `items` i JOIN `users` s ON i.seller_id = s.id LEFT JOIN `users` b ON i.buyer_id = b.id LEFT JOIN `transaction_evidences` t ON i.id = t.item_id LEFT JOIN `shippings` sh ON t.id = sh.transaction_evidence_id WHERE (i.`seller_id` = ? OR i.`buyer_id` = ?) AND i.`status` IN (?,?,?,?,?) ORDER BY i.`created_at` DESC, i.`id` DESC LIMIT ?",
+			"SELECT i.id, i.seller_id, i.buyer_id, i.status, i.name, i.price, i.description, i.image_name, i.category_id, i.created_at, s.account_name, s.num_sell_items, b.account_name, b.num_sell_items, t.id, t.status, sh.status FROM `items` i JOIN `users` s ON i.seller_id = s.id LEFT JOIN `users` b ON i.buyer_id = b.id LEFT JOIN `transaction_evidences` t ON i.id = t.item_id LEFT JOIN `shippings` sh ON t.id = sh.transaction_evidence_id WHERE (i.`seller_id` = ? OR i.`buyer_id` = ?) AND i.`status` IN (?,?,?,?,?) ORDER BY i.`created_at` DESC, i.`id` DESC LIMIT ?",
 			userID,
 			userID,
 			ItemStatusOnSale,
@@ -945,8 +958,6 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 
 	itemDetails := make([]ItemDetail, TransactionsPerPage+1)
 	itemCount := 0
-	apiwg := &sync.WaitGroup{}
-	var apiErrs error
 	{
 		defer rows.Close()
 		for rows.Next() {
@@ -959,9 +970,9 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			var bNum int
 			var tID int64
 			var tStatus string
-			var reserveID string
+			var sStatus string
 			itemDetails[i].Seller = &UserSimple{}
-			err = rows.Scan(&itemDetails[i].ID, &itemDetails[i].SellerID, &itemDetails[i].BuyerID, &itemDetails[i].Status, &itemDetails[i].Name, &itemDetails[i].Price, &itemDetails[i].Description, &imageName, &itemDetails[i].CategoryID, &t, &itemDetails[i].Seller.AccountName, &itemDetails[i].Seller.NumSellItems, &bName, &bNum, &tID, &tStatus, &reserveID)
+			err = rows.Scan(&itemDetails[i].ID, &itemDetails[i].SellerID, &itemDetails[i].BuyerID, &itemDetails[i].Status, &itemDetails[i].Name, &itemDetails[i].Price, &itemDetails[i].Description, &imageName, &itemDetails[i].CategoryID, &t, &itemDetails[i].Seller.AccountName, &itemDetails[i].Seller.NumSellItems, &bName, &bNum, &tID, &tStatus, &sStatus)
 			itemDetails[i].Seller.ID = itemDetails[i].SellerID
 			itemDetails[i].ImageURL = getImageURL(imageName)
 			itemDetails[i].CreatedAt = t.Unix()
@@ -977,30 +988,11 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			if tID > 0 {
 				itemDetails[i].TransactionEvidenceID = tID
 				itemDetails[i].TransactionEvidenceStatus = tStatus
-
-				apiwg.Add(1)
-				go func() {
-					ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-						ReserveID: reserveID,
-					})
-					apiwg.Done()
-					if err != nil {
-						apiErrs = err
-					} else {
-						itemDetails[i].ShippingStatus = ssr.Status
-					}
-				}()
+				itemDetails[i].ShippingStatus = sStatus
 			}
 
 			itemCount = itemCount + 1
 		}
-	}
-
-	apiwg.Wait()
-	if apiErrs != nil {
-		log.Print(apiErrs)
-		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-		return
 	}
 
 	hasNext := false
@@ -1258,7 +1250,23 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 	tx := dbx.MustBegin()
 
 	targetItem := Item{}
-	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", rb.ItemID)
+	var sellerAccountName string
+	var sellerAddress string
+	err = tx.QueryRowx("SELECT i.id, i.seller_id, i.buyer_id, i.status, i.name, i.price, i.description, i.image_name, i.category_id, i.created_at, i.updated_at, u.account_name, u.address FROM `items` i JOIN `users` u ON i.seller_id = u.id WHERE i.`id` = ? FOR UPDATE", rb.ItemID).Scan(
+		&targetItem.ID,
+		&targetItem.SellerID,
+		&targetItem.BuyerID,
+		&targetItem.Status,
+		&targetItem.Name,
+		&targetItem.Price,
+		&targetItem.Description,
+		&targetItem.ImageName,
+		&targetItem.CategoryID,
+		&targetItem.CreatedAt,
+		&targetItem.UpdatedAt,
+		&sellerAccountName,
+		&sellerAddress,
+	)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		tx.Rollback()
@@ -1280,21 +1288,6 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 
 	if targetItem.SellerID == buyer.ID {
 		outputErrorMsg(w, http.StatusForbidden, "自分の商品は買えません")
-		tx.Rollback()
-		return
-	}
-
-	seller := User{}
-	err = tx.Get(&seller, "SELECT * FROM `users` WHERE `id` = ? FOR UPDATE", targetItem.SellerID)
-	if err == sql.ErrNoRows {
-		outputErrorMsg(w, http.StatusNotFound, "seller not found")
-		tx.Rollback()
-		return
-	}
-	if err != nil {
-		log.Print(err)
-
-		outputErrorMsg(w, http.StatusInternalServerError, "db error")
 		tx.Rollback()
 		return
 	}
@@ -1350,28 +1343,45 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scr, err := APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
-		ToAddress:   buyer.Address,
-		ToName:      buyer.AccountName,
-		FromAddress: seller.Address,
-		FromName:    seller.AccountName,
-	})
-	if err != nil {
-		log.Print(err)
+	var apiwg sync.WaitGroup
+
+	var shipErr error
+	var scr *APIShipmentCreateRes
+	apiwg.Add(1)
+	go func() {
+		scr, shipErr = APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
+			ToAddress:   buyer.Address,
+			ToName:      buyer.AccountName,
+			FromAddress: sellerAddress,
+			FromName:    sellerAccountName,
+		})
+		apiwg.Done()
+	}()
+
+	var payErr error
+	var pstr *APIPaymentServiceTokenRes
+	apiwg.Add(1)
+	go func() {
+		pstr, payErr = APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
+			ShopID: PaymentServiceIsucariShopID,
+			Token:  rb.Token,
+			APIKey: PaymentServiceIsucariAPIKey,
+			Price:  targetItem.Price,
+		})
+		apiwg.Done()
+	}()
+
+	apiwg.Wait()
+	if shipErr != nil {
+		log.Print(shipErr)
 		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
 		tx.Rollback()
 
 		return
 	}
 
-	pstr, err := APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
-		ShopID: PaymentServiceIsucariShopID,
-		Token:  rb.Token,
-		APIKey: PaymentServiceIsucariAPIKey,
-		Price:  targetItem.Price,
-	})
-	if err != nil {
-		log.Print(err)
+	if payErr != nil {
+		log.Print(payErr)
 
 		outputErrorMsg(w, http.StatusInternalServerError, "payment service is failed")
 		tx.Rollback()
@@ -1405,8 +1415,8 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		scr.ReserveTime,
 		buyer.Address,
 		buyer.AccountName,
-		seller.Address,
-		seller.AccountName,
+		sellerAddress,
+		sellerAccountName,
 		"",
 	)
 	if err != nil {
