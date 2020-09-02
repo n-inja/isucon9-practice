@@ -1035,8 +1035,32 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item := Item{}
-	err = dbx.Get(&item, "SELECT * FROM `items` WHERE `id` = ?", itemID)
+	item := ItemDetail{}
+	item.Seller = &UserSimple{}
+	var buyerName sql.NullString
+	var buyerNum sql.NullInt32
+	var imageName string
+	var tID sql.NullInt64
+	var tStatus sql.NullString
+	var sStatus sql.NullString
+	var t time.Time
+	err = dbx.QueryRowx("SELECT i.id, i.seller_id, i.buyer_id, i.status, i.name, i.price, i.description, i.image_name, i.category_id, i.created_at, s.account_name, s.num_sell_items, b.account_name, b.num_sell_items, t.id, t.status, sh.status FROM `items` i JOIN `users` s ON i.seller_id = s.id LEFT JOIN `users` b ON i.buyer_id = b.id LEFT JOIN `transaction_evidences` t ON i.id = t.item_id LEFT JOIN `shippings` sh ON t.id = sh.transaction_evidence_id WHERE i.`id` = ?",
+		itemID).Scan(&item.ID, &item.SellerID, &item.BuyerID, &item.Status, &item.Name, &item.Price, &item.Description, &imageName, &item.CategoryID, &t, &item.Seller.AccountName, &item.Seller.NumSellItems, &buyerName, &buyerNum, &tID, &tStatus, &sStatus)
+	if (userID == item.SellerID || userID == item.BuyerID) && item.BuyerID != 0 {
+		item.Buyer = &UserSimple{
+			ID:           item.BuyerID,
+			AccountName:  buyerName.String,
+			NumSellItems: int(buyerNum.Int32),
+		}
+		item.TransactionEvidenceID = tID.Int64
+		item.TransactionEvidenceStatus = tStatus.String
+		item.ShippingStatus = sStatus.String
+	} else {
+		item.BuyerID = 0
+	}
+	item.Seller.ID = item.SellerID
+	item.CreatedAt = t.Unix()
+
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		return
@@ -1052,71 +1076,11 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 		outputErrorMsg(w, http.StatusNotFound, "category not found")
 		return
 	}
-
-	seller, err := getUserSimpleByID(dbx, item.SellerID)
-	if err != nil {
-		outputErrorMsg(w, http.StatusNotFound, "seller not found")
-		return
-	}
-
-	itemDetail := ItemDetail{
-		ID:       item.ID,
-		SellerID: item.SellerID,
-		Seller:   &seller,
-		// BuyerID
-		// Buyer
-		Status:      item.Status,
-		Name:        item.Name,
-		Price:       item.Price,
-		Description: item.Description,
-		ImageURL:    getImageURL(item.ImageName),
-		CategoryID:  item.CategoryID,
-		// TransactionEvidenceID
-		// TransactionEvidenceStatus
-		// ShippingStatus
-		Category:  &category,
-		CreatedAt: item.CreatedAt.Unix(),
-	}
-
-	if (userID == item.SellerID || userID == item.BuyerID) && item.BuyerID != 0 {
-		buyer, err := getUserSimpleByID(dbx, item.BuyerID)
-		if err != nil {
-			outputErrorMsg(w, http.StatusNotFound, "buyer not found")
-			return
-		}
-		itemDetail.BuyerID = item.BuyerID
-		itemDetail.Buyer = &buyer
-
-		transactionEvidence := TransactionEvidence{}
-		err = dbx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
-		if err != nil && err != sql.ErrNoRows {
-			// It's able to ignore ErrNoRows
-			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
-			return
-		}
-
-		if transactionEvidence.ID > 0 {
-			shipping := Shipping{}
-			err = dbx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
-			if err == sql.ErrNoRows {
-				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
-				return
-			}
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "db error")
-				return
-			}
-
-			itemDetail.TransactionEvidenceID = transactionEvidence.ID
-			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
-			itemDetail.ShippingStatus = shipping.Status
-		}
-	}
+	item.Category = &category
+	item.ImageURL = getImageURL(imageName)
 
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
-	json.NewEncoder(w).Encode(itemDetail)
+	json.NewEncoder(w).Encode(item)
 }
 
 func postItemEdit(w http.ResponseWriter, r *http.Request) {
@@ -1271,7 +1235,6 @@ func getQRCode(w http.ResponseWriter, r *http.Request) {
 }
 
 func postBuy(w http.ResponseWriter, r *http.Request) {
-	// TODO あとでみる
 	rb := reqBuy{}
 
 	err := json.NewDecoder(r.Body).Decode(&rb)
